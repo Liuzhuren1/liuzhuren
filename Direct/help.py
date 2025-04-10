@@ -18,6 +18,10 @@ j = torch.tensor([0 + 1j], dtype=torch.complex128, device=device)  # 虚数单�
 # 上采样尺寸
 UPSAMPLED_SIZE = 211
 
+# 像素尺寸参数
+INPUT_PIXEL_SIZE = 8e-6  # 输入像素尺寸 (8微米)
+UPSAMPLED_PIXEL_SIZE = 7.56e-6  # 上采样后像素尺寸 (7.56微米)
+
 # ---------------------输出区域划分---------------------
 square_size = round(M / 20)  # 每个数字区域的边长
 canvas_size = M  # 画布大小
@@ -151,25 +155,106 @@ class modulation_layer(nn.Module):
 
 class NonLinearLayer(nn.Module):
     """
-    非线性层：模拟光学非线性效应
-    实现可训练的参数化非线性处理
+    非线性层：模拟光学非线性效应和空间光调制器(SLM)
+    实现可训练的参数化非线性处理，使用傅里叶变换方法进行上下采样
+    考虑不同像素尺寸：输入8微米，上采样后7.56微米
     """
 
-    def __init__(self, input_size=200, upsampled_size=211):
+    def __init__(self, input_size=200, upsampled_size=211, 
+                input_pixel_size=INPUT_PIXEL_SIZE, upsampled_pixel_size=UPSAMPLED_PIXEL_SIZE):
         """
         初始化非线性层
         参数:
             input_size: 输入图像尺寸
             upsampled_size: 上采样后的图像尺寸
+            input_pixel_size: 输入像素尺寸（8微米）
+            upsampled_pixel_size: 上采样后像素尺寸（7.56微米）
         """
         super(NonLinearLayer, self).__init__()
         self.input_size = input_size
         self.upsampled_size = upsampled_size
+        self.input_pixel_size = input_pixel_size
+        self.upsampled_pixel_size = upsampled_pixel_size
         
-        # 定义可训练参数，每个像素点对应一个二值参数（0或1）
+        # 计算物理尺寸关系（确保物理场景大小匹配）
+        self.input_physical_size = input_size * input_pixel_size
+        self.upsampled_physical_size = upsampled_size * upsampled_pixel_size
+        
+        # 定义可训练参数，用于空间光调制模拟
         self.pixel_weights = nn.Parameter(torch.zeros((upsampled_size, upsampled_size)))
-        # 使用Sigmoid函数将参数映射到0-1之间，然后通过阈值将其二值化
         nn.init.uniform_(self.pixel_weights, a=-1, b=1)  # 初始化参数
+        
+        # 创建SLM的像素响应模式 (考虑填充因子和衍射效应)
+        self.register_buffer('fill_factor', torch.tensor(0.93))  # SLM的填充因子
+        
+        # 计算相对尺度因子（用于像素响应函数）
+        scale_factor = upsampled_pixel_size / input_pixel_size
+        
+        # 初始化SLM的物理特性参数
+        grid_x, grid_y = torch.meshgrid(
+            torch.linspace(-upsampled_size//2, upsampled_size//2, upsampled_size),
+            torch.linspace(-upsampled_size//2, upsampled_size//2, upsampled_size),
+            indexing='ij'
+        )
+        # 生成像素响应函数（高斯模型）- 调整sigma以匹配物理尺寸
+        sigma = 0.5 / scale_factor  # 高斯宽度随像素大小变化
+        self.register_buffer('pixel_response', torch.exp(-(grid_x**2 + grid_y**2) / (2 * sigma**2)))
+
+    def fft_resample(self, x, target_size, mode='up', src_pixel_size=None, target_pixel_size=None):
+        """
+        基于傅里叶变换的重采样方法，保持光场的物理特性
+        参数:
+            x: 输入光场
+            target_size: 目标尺寸
+            mode: 'up' 表示上采样，'down' 表示下采样
+            src_pixel_size: 源像素尺寸
+            target_pixel_size: 目标像素尺寸
+        返回:
+            重采样后的光场
+        """
+        # 设置默认像素尺寸
+        if src_pixel_size is None:
+            src_pixel_size = self.input_pixel_size if mode=='up' else self.upsampled_pixel_size
+        if target_pixel_size is None:
+            target_pixel_size = self.upsampled_pixel_size if mode=='up' else self.input_pixel_size
+            
+        # 获取输入尺寸
+        input_size = x.shape[-1]
+        
+        # 计算物理场景尺寸（确保上下采样前后物理尺寸一致）
+        src_physical_size = input_size * src_pixel_size
+        target_physical_size = target_size * target_pixel_size
+        
+        # 计算相对尺度变化
+        scale_ratio = src_physical_size / target_physical_size
+        
+        # 执行傅里叶变换 (使用fftshift确保零频率位于中心)
+        X = torch.fft.fftshift(torch.fft.fft2(torch.fft.ifftshift(x, dim=(-2, -1))), dim=(-2, -1))
+        
+        if mode == 'up':
+            # 上采样：频域零填充，从8微米降到7.56微米
+            pad_size = (target_size - input_size) // 2
+            X_padded = F.pad(X, (pad_size, pad_size, pad_size, pad_size), "constant", 0)
+            
+            # 能量校正：由于像素密度增加，需要调整振幅
+            # 物理能量守恒：总能量=强度积分，积分区域变小但总能量不变
+            energy_scale = (src_pixel_size / target_pixel_size)**2
+        else:
+            # 下采样：截取频谱中心部分，从7.56微米恢复到8微米
+            start = (input_size - target_size) // 2
+            end = start + target_size
+            X_padded = X[:, :, start:end, start:end] if len(X.shape) == 4 else X[start:end, start:end]
+            
+            # 能量校正：由于像素密度降低，需要调整振幅
+            energy_scale = (src_pixel_size / target_pixel_size)**2
+            
+        # 执行反傅里叶变换，恢复到空域
+        x_resampled = torch.fft.fftshift(torch.fft.ifft2(torch.fft.ifftshift(X_padded, dim=(-2, -1))), dim=(-2, -1))
+        
+        # 应用能量守恒校正（复振幅幅值调整）
+        x_resampled = x_resampled * torch.sqrt(energy_scale)
+        
+        return x_resampled
 
     def forward(self, x):
         """
@@ -185,63 +270,59 @@ class NonLinearLayer(nn.Module):
         # 处理复数类型
         is_complex = torch.is_complex(x)
         
-        # 如果是复数，分离实部和虚部
-        if is_complex:
-            real_part = x.real
-            imag_part = x.imag
-        else:
-            real_part = x
-            imag_part = None
-        
         # 确保输入是4D张量 (batch_size, channels, height, width)
-        if len(real_part.shape) == 2:
-            real_part = real_part.unsqueeze(0).unsqueeze(0)  # 添加batch和channel维度
-            if imag_part is not None:
-                imag_part = imag_part.unsqueeze(0).unsqueeze(0)
-        elif len(real_part.shape) == 3:
-            real_part = real_part.unsqueeze(1)  # 添加channel维度
-            if imag_part is not None:
-                imag_part = imag_part.unsqueeze(1)
+        if len(x.shape) == 2:
+            x = x.unsqueeze(0).unsqueeze(0)  # 添加batch和channel维度
+        elif len(x.shape) == 3:
+            x = x.unsqueeze(1)  # 添加channel维度
             
-        # 上采样到211x211
-        real_part_upsampled = F.interpolate(real_part, size=(self.upsampled_size, self.upsampled_size), 
-                                    mode='bilinear', align_corners=False)
+        # 使用傅里叶方法进行上采样 (从8微米到7.56微米)
+        x_upsampled = self.fft_resample(
+            x, 
+            self.upsampled_size, 
+            mode='up', 
+            src_pixel_size=self.input_pixel_size,
+            target_pixel_size=self.upsampled_pixel_size
+        )
         
-        if imag_part is not None:
-            imag_part_upsampled = F.interpolate(imag_part, size=(self.upsampled_size, self.upsampled_size), 
-                                        mode='bilinear', align_corners=False)
-        
-        # 将参数二值化（0或1）
+        # 将参数映射到[0,1]区间，模拟SLM的二值响应
         binary_weights = (torch.sigmoid(self.pixel_weights) > 0.5).float()
-        binary_weights = binary_weights.unsqueeze(0).unsqueeze(0)  # 添加batch和channel维度
         
-        # 应用非线性处理：每个像素点要么保持原值，要么置零
-        real_part_processed = real_part_upsampled * binary_weights
+        # 应用像素填充因子和像素响应函数，模拟真实SLM的物理特性
+        # 1. 考虑填充因子：非有效区域不影响光场
+        effective_weights = binary_weights * self.fill_factor
         
-        if imag_part is not None:
-            imag_part_processed = imag_part_upsampled * binary_weights
+        # 2. 应用像素响应函数（卷积操作模拟像素间的衍射效应）
+        # 将响应函数转换为卷积核
+        kernel = self.pixel_response.unsqueeze(0).unsqueeze(0)
         
-        # 下采样回原始尺寸
-        real_part_downsampled = F.interpolate(real_part_processed, size=(self.input_size, self.input_size), 
-                                     mode='bilinear', align_corners=False)
+        # 对二值掩码应用卷积，模拟实际的衍射效应
+        # 使用mode='same'确保输出尺寸不变
+        binary_weights_filtered = F.conv2d(
+            effective_weights.unsqueeze(0), 
+            kernel, 
+            padding=kernel.shape[-1]//2
+        ).squeeze(0)
         
-        if imag_part is not None:
-            imag_part_downsampled = F.interpolate(imag_part_processed, size=(self.input_size, self.input_size), 
-                                         mode='bilinear', align_corners=False)
+        # 应用非线性处理
+        x_processed = x_upsampled * binary_weights_filtered
         
-        # 如果是复数，重新组合实部和虚部
-        if is_complex:
-            result = torch.complex(real_part_downsampled, imag_part_downsampled)
-        else:
-            result = real_part_downsampled
+        # 使用傅里叶方法进行下采样回原始尺寸 (从7.56微米回到8微米)
+        x_downsampled = self.fft_resample(
+            x_processed, 
+            self.input_size, 
+            mode='down',
+            src_pixel_size=self.upsampled_pixel_size,
+            target_pixel_size=self.input_pixel_size
+        )
         
         # 恢复原始形状
         if len(original_shape) == 2:
-            return result.squeeze(0).squeeze(0)
+            return x_downsampled.squeeze(0).squeeze(0)
         elif len(original_shape) == 3:
-            return result.squeeze(1)
+            return x_downsampled.squeeze(1)
         else:
-            return result
+            return x_downsampled
 
 
 class imaging_layer(nn.Module):
@@ -283,14 +364,33 @@ class OpticalNetwork(nn.Module):
         # 定义网络各层
         self.mod1 = modulation_layer(M, M)  # 第一相位调制层
         self.propagate1 = propagation_layer(L, lmbda, z)  # 第一传播层
-        self.nonlinear1 = NonLinearLayer()  # 第一非线性层
+        self.nonlinear1 = NonLinearLayer(
+            input_size=M, 
+            upsampled_size=UPSAMPLED_SIZE,
+            input_pixel_size=INPUT_PIXEL_SIZE,
+            upsampled_pixel_size=UPSAMPLED_PIXEL_SIZE
+        )  # 第一非线性层
         self.propagate2 = propagation_layer(L, lmbda, z)  # 第二传播层
         self.mod2 = modulation_layer(M, M)  # 第二相位调制层
         self.propagate3 = propagation_layer(L, lmbda, z)  # 第三传播层
-        self.nonlinear2 = NonLinearLayer()  # 第二非线性层
+        self.nonlinear2 = NonLinearLayer(
+            input_size=M, 
+            upsampled_size=UPSAMPLED_SIZE,
+            input_pixel_size=INPUT_PIXEL_SIZE,
+            upsampled_pixel_size=UPSAMPLED_PIXEL_SIZE
+        )  # 第二非线性层
         self.propagate4 = propagation_layer(L, lmbda, z)  # 第四传播层
         self.mod3 = modulation_layer(M, M)  # 第三相位调制层
         self.propagate5 = propagation_layer(L, lmbda, z)  # 第五传播层
+        self.nonlinear3 = NonLinearLayer(
+            input_size=M, 
+            upsampled_size=UPSAMPLED_SIZE,
+            input_pixel_size=INPUT_PIXEL_SIZE,
+            upsampled_pixel_size=UPSAMPLED_PIXEL_SIZE
+        )  # 第二非线性层
+        self.propagate6 = propagation_layer(L, lmbda, z)  # 第四传播层
+        self.mod4 = modulation_layer(M, M)  # 第三相位调制层
+        self.propagate7 = propagation_layer(L, lmbda, z)  # 第五传播层
         self.imaging = imaging_layer()  # 成像层
 
     def forward(self, x):
@@ -311,5 +411,9 @@ class OpticalNetwork(nn.Module):
         x = self.propagate4(x)  # 第四次传播
         x = self.mod3(x)  # 第三次相位调制
         x = self.propagate5(x)  # 第五次传播
+        x = self.nonlinear3(x)  # 第三非线性处理
+        x = self.propagate6(x)  # 第六次传播
+        x = self.mod4(x)  # 第四次相位调制
+        x = self.propagate7(x)  # 第七次传播
         x = self.imaging(x)  # 转换为光强图像
         return x
